@@ -59,7 +59,7 @@ def _ensure_dirs():
 def _load_members_csv() -> pd.DataFrame:
     _ensure_dirs()
     if not os.path.exists(MEMBERS_CSV):
-        cols = ["created_at", "name", "phone_e164", "phone_hash"]
+        cols = ["created_at", "name", "phone_e164"]
         return pd.DataFrame(columns=cols)
     return pd.read_csv(MEMBERS_CSV, dtype=str)
 
@@ -94,19 +94,7 @@ def _supabase_enabled() -> bool:
     except Exception:
         return False
 
-def _supabase_upsert_member(name: str, phone_e164: str, phone_hash: str) -> bool:
-    """
-    Supabase REST upsert (테이블: public.members)
-    사전 준비:
-      create table if not exists public.members (
-        id uuid primary key default gen_random_uuid(),
-        name text not null,
-        phone_e164 text not null,
-        phone_hash text unique,
-        marketing_optin boolean default false,
-        created_at timestamptz default now()
-      );
-    """
+def _supabase_upsert_member(name: str, phone_e164: str) -> bool:
     try:
         url = st.secrets["supabase"]["url"].rstrip("/") + "/rest/v1/members"
         key = st.secrets["supabase"]["service_role_key"]
@@ -116,11 +104,11 @@ def _supabase_upsert_member(name: str, phone_e164: str, phone_hash: str) -> bool
             "Content-Type": "application/json",
             "Prefer": "resolution=merge-duplicates,return=representation"
         }
-        payload = {"name": name, "phone_e164": phone_e164, "phone_hash": phone_hash}
+        payload = {"name": name, "phone_e164": phone_e164}
         r = requests.post(url, headers=headers, json=payload, timeout=12)
         if r.status_code not in (200, 201):
             if r.status_code == 409:
-                r2 = requests.patch(url + f"?phone_hash=eq.{phone_hash}", headers=headers, json=payload, timeout=12)
+                r2 = requests.patch(url + f"?phone_e164=eq.{phone_e164}", headers=headers, json=payload, timeout=12)
                 r2.raise_for_status()
             else:
                 r.raise_for_status()
@@ -134,7 +122,6 @@ def register_or_login(name: str, phone: str) -> tuple[bool, str]:
     이름/전화로 간편 가입+로그인.
     - 이미 존재: 로그인 처리
     - 없으면: 신규 가입(csv append + (옵션) supabase 업서트)
-    return: (성공여부, 메시지)
     """
     name = (name or "").strip()
     if not name:
@@ -142,28 +129,33 @@ def register_or_login(name: str, phone: str) -> tuple[bool, str]:
     phone_e164 = _normalize_e164(phone or "")
     if not phone_e164:
         return False, "전화번호를 정확히 입력해주세요."
-    ph = _phone_hash(phone_e164)
 
     df = _load_members_csv()
-    exists = False if df.empty else ph in set(df["phone_hash"])
+    exists = False if df.empty else phone_e164 in set(df["phone_e164"])
 
     if not exists:
         row = pd.DataFrame([{
             "created_at": datetime.datetime.utcnow().isoformat(),
             "name": name,
-            "phone_e164": phone_e164,
-            "phone_hash": ph
+            "phone_e164": phone_e164
         }])
         df = pd.concat([df, row], ignore_index=True)
-        df = df.drop_duplicates(subset=["phone_hash"], keep="first")
+        df = df.drop_duplicates(subset=["phone_e164"], keep="first")
         _save_members_csv(df)
+
+        # supabase 업서트도 phone_e164 그대로
         if _supabase_enabled():
-            _supabase_upsert_member(name, phone_e164, ph)
-    # 로그인 처리(신규 또는 기존)
-    st.session_state["member_name"] = name
-    st.session_state["member_phone_e164"] = phone_e164
-    st.session_state["logged_in"] = True
-    return True, f"{name}님 환영합니다! 🎉"
+            _supabase_upsert_member(name, phone_e164)
+
+        st.session_state["member_name"] = name
+        st.session_state["member_phone_e164"] = phone_e164
+        st.session_state["logged_in"] = True
+        return True, f"{name}님 가입이 완료되었어요! 🎉"
+    else:
+        st.session_state["member_name"] = name
+        st.session_state["member_phone_e164"] = phone_e164
+        st.session_state["logged_in"] = True
+        return True, f"{name}님 환영합니다! 🎉"
 
 # =========================
 # 2) 로그인/회원 UI
@@ -344,7 +336,7 @@ with tab_reco:
 
                     # 롤링 빈도(선택 번호만)
                     subR = R[[n for n in picked]]
-                    fig_roll = px.line(subR, title=f"최근 {LOOKBACK}회 롤링 빈도(선택 번호만)",
+                    fig_roll = px.line(subR, title=f"최근 {LOOKBACK}회 롤링 빈도",
                                        labels={"index": "회차(draw_no)", "value": "빈도(창 내)"})
                     fig_roll.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
                                            plot_bgcolor="rgba(0,0,0,0)", height=300,
