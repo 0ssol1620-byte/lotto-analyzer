@@ -23,21 +23,38 @@ from viz import (
 st.set_page_config(page_title="Lotto 6/45 Analyzer — Pro", page_icon="🎯", layout="wide")
 apply_global_style()
 
+# Streamlit 기본 UI 숨김 (상단 메뉴/헤더/푸터/하단 배지)
+st.markdown("""
+<style>
+#MainMenu {visibility: hidden;}
+header {visibility: hidden;}
+footer {visibility: hidden;}
+/* 일부 버전에서 우하단 배지/도구 위젯 숨김 */
+div[class^="viewerBadge"] {display:none !important;}
+div[data-testid="stStatusWidget"] {display:none !important;}
+</style>
+""", unsafe_allow_html=True)
+
 # 옵션 고정(사이드바 제거)
 INCLUDE_BONUS: bool = True
 TOPN: int = 50
 LOOKBACK: int = 500
 COMPACT: bool = True
-BAR_DIR: str = "세로"  # 고정
+BAR_DIR: str = "세로"  # 고정 (세로 차트만 사용)
 
 DATA_CSV = "data/lotto_draws.csv"
 MEMBERS_CSV = "data/members.csv"
+
+# 관리자 계정 (E.164 정규화 기준)
+ADMIN_NAME = "김영솔"
+ADMIN_PHONE_E164 = "+821024647664"
 
 # =========================
 # 1) 회원 저장/조회 유틸 (CSV + Supabase)
 # =========================
 def _ensure_dirs():
     os.makedirs(os.path.dirname(DATA_CSV) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(MEMBERS_CSV) or ".", exist_ok=True)
 
 def _load_members_csv() -> pd.DataFrame:
     _ensure_dirs()
@@ -47,21 +64,24 @@ def _load_members_csv() -> pd.DataFrame:
     return pd.read_csv(MEMBERS_CSV, dtype=str)
 
 def _save_members_csv(df: pd.DataFrame):
+    _ensure_dirs()
     df.to_csv(MEMBERS_CSV, index=False, encoding="utf-8-sig")
 
 def _normalize_e164(phone: str) -> str:
-    # 숫자만 남김
+    """
+    010-1234-5678 / 01012345678 / +82 10 1234 5678 등 → +821012345678
+    (숫자 이외 제거 후 한국 가정)
+    """
     p = re.sub(r"\D", "", phone or "")
     if not p:
         return ""
-    # 한국 기본 가정: 010-1234-5678 → +821012345678
     if p.startswith("0"):
         return "+82" + p[1:]
     if p.startswith("82"):
         return "+" + p
-    if phone.startswith("+"):
-        return phone
-    return "+82" + p  # 나머지 숫자도 한국 기본
+    if phone.strip().startswith("+"):
+        return phone.strip()
+    return "+82" + p  # 그 외도 한국 기본
 
 def _phone_hash(phone_e164: str) -> str:
     return hashlib.sha256((phone_e164 or "").encode("utf-8")).hexdigest()
@@ -77,7 +97,7 @@ def _supabase_enabled() -> bool:
 def _supabase_upsert_member(name: str, phone_e164: str, phone_hash: str) -> bool:
     """
     Supabase REST upsert (테이블: public.members)
-    사전 준비(한 번만):
+    사전 준비:
       create table if not exists public.members (
         id uuid primary key default gen_random_uuid(),
         name text not null,
@@ -86,7 +106,6 @@ def _supabase_upsert_member(name: str, phone_e164: str, phone_hash: str) -> bool
         marketing_optin boolean default false,
         created_at timestamptz default now()
       );
-    RLS는 service_role_key 사용 전제로 off 또는 적절 정책.
     """
     try:
         url = st.secrets["supabase"]["url"].rstrip("/") + "/rest/v1/members"
@@ -99,9 +118,7 @@ def _supabase_upsert_member(name: str, phone_e164: str, phone_hash: str) -> bool
         }
         payload = {"name": name, "phone_e164": phone_e164, "phone_hash": phone_hash}
         r = requests.post(url, headers=headers, json=payload, timeout=12)
-        # 409 중복 등은 upsert 옵션으로 해결, 실패 시 raise
         if r.status_code not in (200, 201):
-            # 409 도착하면 merge가 안 먹는 환경일 수 있음 → PATCH로 시도
             if r.status_code == 409:
                 r2 = requests.patch(url + f"?phone_hash=eq.{phone_hash}", headers=headers, json=payload, timeout=12)
                 r2.raise_for_status()
@@ -109,7 +126,6 @@ def _supabase_upsert_member(name: str, phone_e164: str, phone_hash: str) -> bool
                 r.raise_for_status()
         return True
     except Exception as e:
-        # Supabase 실패는 CSV에는 영향X (로그만)
         st.info(f"Supabase 저장 건너뜀: {e}")
         return False
 
@@ -139,22 +155,15 @@ def register_or_login(name: str, phone: str) -> tuple[bool, str]:
             "phone_hash": ph
         }])
         df = pd.concat([df, row], ignore_index=True)
-        # 중복 제거 안전망
         df = df.drop_duplicates(subset=["phone_hash"], keep="first")
         _save_members_csv(df)
-        # 옵션: Supabase 업서트
         if _supabase_enabled():
             _supabase_upsert_member(name, phone_e164, ph)
-        st.session_state["member_name"] = name
-        st.session_state["member_phone_e164"] = phone_e164
-        st.session_state["logged_in"] = True
-        return True, f"{name}님 가입이 완료되었어요! 🎉"
-    else:
-        # 로그인 처리
-        st.session_state["member_name"] = name
-        st.session_state["member_phone_e164"] = phone_e164
-        st.session_state["logged_in"] = True
-        return True, f"{name}님 환영합니다! 🎉"
+    # 로그인 처리(신규 또는 기존)
+    st.session_state["member_name"] = name
+    st.session_state["member_phone_e164"] = phone_e164
+    st.session_state["logged_in"] = True
+    return True, f"{name}님 환영합니다! 🎉"
 
 # =========================
 # 2) 로그인/회원 UI
@@ -171,7 +180,7 @@ def signin_block():
             if st.button("로그아웃"):
                 for k in ["logged_in", "member_name", "member_phone_e164"]:
                     st.session_state.pop(k, None)
-                st.rerun()  # ← 변경: experimental_rerun() → rerun()
+                st.rerun()
         return
 
     st.subheader("🔒 로그인 / 간편 가입")
@@ -183,10 +192,9 @@ def signin_block():
             ok, msg = register_or_login(name, phone)
             if ok:
                 st.success(msg)
-                st.rerun()  # ← 변경: experimental_rerun() → rerun()
+                st.rerun()
             else:
                 st.error(msg)
-
 
 def locked_box(height: int = 220, msg: str = "🔒 로그인 후 확인 가능합니다"):
     st.markdown(
@@ -206,7 +214,7 @@ def locked_box(height: int = 220, msg: str = "🔒 로그인 후 확인 가능�
 # =========================
 # 3) 데이터 로딩 & KPI
 # =========================
-os.makedirs(os.path.dirname(DATA_CSV) or ".", exist_ok=True)
+_ensure_dirs()
 if "df" not in st.session_state:
     st.session_state["df"] = load_csv(DATA_CSV)
 df = st.session_state["df"]
@@ -234,12 +242,27 @@ co_df = cooccurrence(only_num)
 corr = only_num.corr(method="pearson")
 
 # =========================
-# 5) 탭 구성
+# 5) 관리자 여부 판별
 # =========================
-tab_reco, tab_comp, tab_fair, tab_members = st.tabs(["🎯 추천 번호", "구성(요약·홀짝·끝자리 등)", "공정성 체크", "회원 관리"])
+is_admin = (
+    st.session_state.get("member_name") == ADMIN_NAME and
+    st.session_state.get("member_phone_e164") == ADMIN_PHONE_E164
+)
+
+# =========================
+# 6) 탭 구성 (관리자만 회원관리 탭 노출)
+# =========================
+if is_admin:
+    tab_reco, tab_comp, tab_fair, tab_admin = st.tabs(
+        ["🎯 추천 번호", "구성(요약·홀짝·끝자리 등)", "공정성 체크", "회원 관리"]
+    )
+else:
+    tab_reco, tab_comp, tab_fair = st.tabs(
+        ["🎯 추천 번호", "구성(요약·홀짝·끝자리 등)", "공정성 체크"]
+    )
 
 # -------------------------
-# 5-1) 추천 번호 탭
+# 6-1) 추천 번호 탭
 # -------------------------
 with tab_reco:
     signin_block()  # 상단 로그인 박스
@@ -332,7 +355,7 @@ with tab_reco:
                     locked_box(320)
 
 # -------------------------
-# 5-2) 구성 탭
+# 6-2) 구성 탭
 # -------------------------
 with tab_comp:
     if not st.session_state.get("logged_in", False):
@@ -358,7 +381,6 @@ with tab_comp:
                                   zmin=0, zmax=vmax, colorscale="YlGnBu", compact=COMPACT)
             st.plotly_chart(fig_co, use_container_width=True)
         with r2c2:
-            # 고정 옵션: abs=True, cluster=True, triangle=True, contrast=0.25
             fig_corr = make_corr_heatmap_pro(
                 corr, title="Correlation Heatmap",
                 abs_mode=True, cluster=True, triangle=True, contrast=0.25, compact=COMPACT
@@ -396,7 +418,7 @@ with tab_comp:
         st.metric("연속수 포함 비율", f"{rate_consec*100:.1f}%")
 
 # -------------------------
-# 5-3) 공정성 체크 탭
+# 6-3) 공정성 체크 탭
 # -------------------------
 with tab_fair:
     if not st.session_state.get("logged_in", False):
@@ -416,37 +438,15 @@ with tab_fair:
         st.caption("모형: 45개 중 6(또는 7)개 무작위 추출 가정. Binomial 상향 단측, FDR 보정(BH).")
 
 # -------------------------
-# 5-4) 회원 관리 탭 (간단 Admin)
+# 6-4) 회원 관리 탭 (관리자만 존재)
 # -------------------------
-with tab_members:
-    st.subheader("👥 회원 관리")
-    # 간단 보호: 관리자 코드(선택) 확인
-    admin_ok = False
-    admin_code_needed = False
-    try:
-        expected = st.secrets["admin"]["code"]
-        admin_code_needed = True
-    except Exception:
-        expected = None
-        admin_code_needed = False
-
-    if admin_code_needed:
-        code = st.text_input("관리자 코드 입력", type="password")
-        if code and expected and code == expected:
-            admin_ok = True
-        elif code:
-            st.error("관리자 코드가 올바르지 않습니다.")
-    else:
-        st.info("관리자 코드가 설정되어 있지 않아 바로 열람됩니다.")
-        admin_ok = True
-
-    if admin_ok:
+if is_admin:
+    with tab_admin:
+        st.subheader("👥 회원 관리 (관리자 전용)")
         mdf = _load_members_csv()
-        st.dataframe(mdf, use_container_width=True, height=420)
+        st.dataframe(mdf, use_container_width=True, height=520)
         st.download_button("⬇️ 회원 CSV 다운로드",
                            data=mdf.to_csv(index=False).encode("utf-8-sig"),
                            file_name="members.csv",
                            mime="text/csv")
         st.caption("※ 전화번호는 해시 및 E.164 형식으로 저장됩니다. 실제 운영 시 보관기간/파기정책을 고지하세요.")
-    else:
-        locked_box(240, "🔒 관리자 검증 필요")
