@@ -171,7 +171,7 @@ def signin_block():
             if st.button("로그아웃"):
                 for k in ["logged_in", "member_name", "member_phone_e164"]:
                     st.session_state.pop(k, None)
-                st.experimental_rerun()
+                st.rerun()  # ← 변경: experimental_rerun() → rerun()
         return
 
     st.subheader("🔒 로그인 / 간편 가입")
@@ -183,9 +183,10 @@ def signin_block():
             ok, msg = register_or_login(name, phone)
             if ok:
                 st.success(msg)
-                st.experimental_rerun()
+                st.rerun()  # ← 변경: experimental_rerun() → rerun()
             else:
                 st.error(msg)
+
 
 def locked_box(height: int = 220, msg: str = "🔒 로그인 후 확인 가능합니다"):
     st.markdown(
