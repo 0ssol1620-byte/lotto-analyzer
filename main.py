@@ -1,9 +1,10 @@
 # app.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import os, io, numpy as np, pandas as pd, streamlit as st, plotly.express as px
+import os, re, hashlib, datetime, requests
+import numpy as np, pandas as pd, streamlit as st, plotly.express as px
 
-from lotto_data import load_csv, incremental_update, frequency, presence_matrix, cooccurrence
+from lotto_data import load_csv, frequency, presence_matrix, cooccurrence
 from rolling import rolling_frequency
 from recs import (
     recommend_hot, recommend_cold, recommend_balanced, recommend_weighted_recent,
@@ -13,264 +14,438 @@ from features import build_features, last_digit_hist
 from fairness import chi_square_uniform, pair_significance_binomial
 from viz import (
     apply_global_style, kpi_card,
-    make_top_frequency_horizontal, make_top_frequency_vertical,
-    make_heatmap, make_corr_heatmap_pro, make_top_pairs_vertical
+    make_top_frequency_vertical, make_heatmap, make_corr_heatmap_pro, make_top_pairs_vertical
 )
 
-PRIMARY = "#1F3A8A"
-
-# -------- Page & Style --------
+# =========================
+# 0) 전역 UI 설정 & 고정 옵션
+# =========================
 st.set_page_config(page_title="Lotto 6/45 Analyzer — Pro", page_icon="🎯", layout="wide")
 apply_global_style()
 
-# -------- Sidebar --------
-with st.sidebar:
-    st.header("⚙️ 옵션")
-    include_bonus = st.toggle("보너스 포함", value=False, help="2등/흥미 비교용, 1등 분석은 보통 제외")
-    topn = st.slider("Top N(빈도/쌍)", 5, 50, 25, 1)
-    lookback = st.slider("최근 N회(가중·롤링)", 50, 500, 200, 10)
-    compact = st.toggle("요약 콤팩트 모드", value=True, help="구성 탭의 핵심 요약 차트 높이를 축소")
-    bar_dir = st.radio("Top 차트 방향", ["세로", "가로"], index=0, horizontal=True)
+# 옵션 고정(사이드바 제거)
+INCLUDE_BONUS: bool = True
+TOPN: int = 50
+LOOKBACK: int = 500
+COMPACT: bool = True
+BAR_DIR: str = "세로"  # 고정
 
-    st.divider()
-    st.header("📦 데이터")
-    data_path = st.text_input("CSV 경로", value="data/lotto_draws.csv")
-    if st.button("데이터 갱신(증분)"):
-        with st.spinner("최신 회차 확인 및 증분 수집 중..."):
-            df_upd, prev, latest = incremental_update(data_path)
-        st.session_state["df"] = df_upd
-        st.success(f"완료: latest={latest}, 총 {len(df_upd):,}행 (이전 max={prev})")
+DATA_CSV = "data/lotto_draws.csv"
+MEMBERS_CSV = "data/members.csv"
 
-# -------- Load data --------
+# =========================
+# 1) 회원 저장/조회 유틸 (CSV + Supabase)
+# =========================
+def _ensure_dirs():
+    os.makedirs(os.path.dirname(DATA_CSV) or ".", exist_ok=True)
+
+def _load_members_csv() -> pd.DataFrame:
+    _ensure_dirs()
+    if not os.path.exists(MEMBERS_CSV):
+        cols = ["created_at", "name", "phone_e164", "phone_hash"]
+        return pd.DataFrame(columns=cols)
+    return pd.read_csv(MEMBERS_CSV, dtype=str)
+
+def _save_members_csv(df: pd.DataFrame):
+    df.to_csv(MEMBERS_CSV, index=False, encoding="utf-8-sig")
+
+def _normalize_e164(phone: str) -> str:
+    # 숫자만 남김
+    p = re.sub(r"\D", "", phone or "")
+    if not p:
+        return ""
+    # 한국 기본 가정: 010-1234-5678 → +821012345678
+    if p.startswith("0"):
+        return "+82" + p[1:]
+    if p.startswith("82"):
+        return "+" + p
+    if phone.startswith("+"):
+        return phone
+    return "+82" + p  # 나머지 숫자도 한국 기본
+
+def _phone_hash(phone_e164: str) -> str:
+    return hashlib.sha256((phone_e164 or "").encode("utf-8")).hexdigest()
+
+def _supabase_enabled() -> bool:
+    try:
+        _ = st.secrets["supabase"]["url"]
+        _ = st.secrets["supabase"]["service_role_key"]
+        return True
+    except Exception:
+        return False
+
+def _supabase_upsert_member(name: str, phone_e164: str, phone_hash: str) -> bool:
+    """
+    Supabase REST upsert (테이블: public.members)
+    사전 준비(한 번만):
+      create table if not exists public.members (
+        id uuid primary key default gen_random_uuid(),
+        name text not null,
+        phone_e164 text not null,
+        phone_hash text unique,
+        marketing_optin boolean default false,
+        created_at timestamptz default now()
+      );
+    RLS는 service_role_key 사용 전제로 off 또는 적절 정책.
+    """
+    try:
+        url = st.secrets["supabase"]["url"].rstrip("/") + "/rest/v1/members"
+        key = st.secrets["supabase"]["service_role_key"]
+        headers = {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates,return=representation"
+        }
+        payload = {"name": name, "phone_e164": phone_e164, "phone_hash": phone_hash}
+        r = requests.post(url, headers=headers, json=payload, timeout=12)
+        # 409 중복 등은 upsert 옵션으로 해결, 실패 시 raise
+        if r.status_code not in (200, 201):
+            # 409 도착하면 merge가 안 먹는 환경일 수 있음 → PATCH로 시도
+            if r.status_code == 409:
+                r2 = requests.patch(url + f"?phone_hash=eq.{phone_hash}", headers=headers, json=payload, timeout=12)
+                r2.raise_for_status()
+            else:
+                r.raise_for_status()
+        return True
+    except Exception as e:
+        # Supabase 실패는 CSV에는 영향X (로그만)
+        st.info(f"Supabase 저장 건너뜀: {e}")
+        return False
+
+def register_or_login(name: str, phone: str) -> tuple[bool, str]:
+    """
+    이름/전화로 간편 가입+로그인.
+    - 이미 존재: 로그인 처리
+    - 없으면: 신규 가입(csv append + (옵션) supabase 업서트)
+    return: (성공여부, 메시지)
+    """
+    name = (name or "").strip()
+    if not name:
+        return False, "이름을 입력해주세요."
+    phone_e164 = _normalize_e164(phone or "")
+    if not phone_e164:
+        return False, "전화번호를 정확히 입력해주세요."
+    ph = _phone_hash(phone_e164)
+
+    df = _load_members_csv()
+    exists = False if df.empty else ph in set(df["phone_hash"])
+
+    if not exists:
+        row = pd.DataFrame([{
+            "created_at": datetime.datetime.utcnow().isoformat(),
+            "name": name,
+            "phone_e164": phone_e164,
+            "phone_hash": ph
+        }])
+        df = pd.concat([df, row], ignore_index=True)
+        # 중복 제거 안전망
+        df = df.drop_duplicates(subset=["phone_hash"], keep="first")
+        _save_members_csv(df)
+        # 옵션: Supabase 업서트
+        if _supabase_enabled():
+            _supabase_upsert_member(name, phone_e164, ph)
+        st.session_state["member_name"] = name
+        st.session_state["member_phone_e164"] = phone_e164
+        st.session_state["logged_in"] = True
+        return True, f"{name}님 가입이 완료되었어요! 🎉"
+    else:
+        # 로그인 처리
+        st.session_state["member_name"] = name
+        st.session_state["member_phone_e164"] = phone_e164
+        st.session_state["logged_in"] = True
+        return True, f"{name}님 환영합니다! 🎉"
+
+# =========================
+# 2) 로그인/회원 UI
+# =========================
+if "logged_in" not in st.session_state:
+    st.session_state["logged_in"] = False
+
+def signin_block():
+    if st.session_state.get("logged_in", False):
+        colA, colB = st.columns([3,1])
+        with colA:
+            st.success(f"✅ 로그인됨: {st.session_state.get('member_name','회원')} ({st.session_state.get('member_phone_e164','')})")
+        with colB:
+            if st.button("로그아웃"):
+                for k in ["logged_in", "member_name", "member_phone_e164"]:
+                    st.session_state.pop(k, None)
+                st.experimental_rerun()
+        return
+
+    st.subheader("🔒 로그인 / 간편 가입")
+    with st.form("login_form", clear_on_submit=False):
+        name = st.text_input("이름", key="login_name")
+        phone = st.text_input("휴대폰 번호 (예: 010-1234-5678 또는 +821012345678)", key="login_phone")
+        submitted = st.form_submit_button("가입 또는 로그인")
+        if submitted:
+            ok, msg = register_or_login(name, phone)
+            if ok:
+                st.success(msg)
+                st.experimental_rerun()
+            else:
+                st.error(msg)
+
+def locked_box(height: int = 220, msg: str = "🔒 로그인 후 확인 가능합니다"):
+    st.markdown(
+        f"""
+        <div style="position:relative;height:{height}px;border-radius:16px;overflow:hidden;border:1px solid #263043;background:#0F172A">
+          <div style="filter:blur(4px);opacity:.6;width:100%;height:100%;background:linear-gradient(135deg,#1E293B 0%,#0B1220 100%);"></div>
+          <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;">
+            <div style="background:rgba(0,0,0,.5);border:1px solid rgba(255,255,255,.1);padding:10px 14px;border-radius:12px;color:#E5E7EB;font-size:14px">
+              {msg}
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+# =========================
+# 3) 데이터 로딩 & KPI
+# =========================
+os.makedirs(os.path.dirname(DATA_CSV) or ".", exist_ok=True)
 if "df" not in st.session_state:
-    os.makedirs(os.path.dirname(data_path) or ".", exist_ok=True)
-    st.session_state["df"] = load_csv(data_path)
+    st.session_state["df"] = load_csv(DATA_CSV)
 df = st.session_state["df"]
 if df.empty:
-    st.warning("CSV가 비어있습니다. 좌측 ‘데이터 갱신(증분)’을 눌러주세요.")
+    st.warning("원본 CSV가 비어 있습니다. `data/lotto_draws.csv`를 업로드/배포해 주세요.")
     st.stop()
 latest = int(df["draw_no"].max())
 
-# -------- KPI (잘림 없는 카드) --------
+# KPI
 c1, c2, c3, c4 = st.columns([1.1, 1.1, 2.4, 1.1])
 with c1: kpi_card("수집 회차", f"{len(df):,}")
 with c2: kpi_card("최신 회차", f"{latest:,}")
 with c3: kpi_card("기간", f"{df['date'].min()} → {df['date'].max()}")
-with c4: kpi_card("보너스 포함", "Yes" if include_bonus else "No")
+with c4: kpi_card("보너스 포함", "Yes" if INCLUDE_BONUS else "No")
 
-st.title("🎯 Lotto 6/45 Analyzer")
+st.title("🎯 Lotto 6/45 Analyzer — Pro")
 
-# -------- Core calculations --------
-freq = frequency(df, include_bonus=include_bonus)
-presence = presence_matrix(df, include_bonus=include_bonus)
-only_num = presence[[str(i) for i in range(1,46)]]
+# =========================
+# 4) 핵심 계산
+# =========================
+freq = frequency(df, include_bonus=INCLUDE_BONUS)
+presence = presence_matrix(df, include_bonus=INCLUDE_BONUS)
+only_num = presence[[str(i) for i in range(1, 46)]]
 co_df = cooccurrence(only_num)
 corr = only_num.corr(method="pearson")
 
-# -------- Tabs (요약 탭 제거, 추천 번호를 첫 탭으로) --------
-tab_reco, tab_comp, tab_fair = st.tabs(["🎯 추천 번호", "구성(요약 · 홀짝·끝자리 등)", "공정성 체크"])
+# =========================
+# 5) 탭 구성
+# =========================
+tab_reco, tab_comp, tab_fair, tab_members = st.tabs(["🎯 추천 번호", "구성(요약·홀짝·끝자리 등)", "공정성 체크", "회원 관리"])
 
-# ======================================================================
-# 1) 추천 번호 탭  (첫 번째 탭)
-# ======================================================================
+# -------------------------
+# 5-1) 추천 번호 탭
+# -------------------------
 with tab_reco:
-    nums_all = list(range(1,46))
+    signin_block()  # 상단 로그인 박스
 
-    # 추천 세트
+    nums_all = list(range(1, 46))
     hot_set = recommend_hot(freq)
     cold_set = recommend_cold(freq)
     bal_set = recommend_balanced(freq)
-    ai_set  = recommend_weighted_recent(df, lookback=lookback, include_bonus=include_bonus)
+    ai_set = recommend_weighted_recent(df, lookback=LOOKBACK, include_bonus=INCLUDE_BONUS)
+
     sets = [
         ("🔥 HOT", hot_set, "최근 빈도 상위 기반"),
         ("❄️ COLD", cold_set, "오랫동안 드문 번호 가미"),
         ("⚖️ BALANCED", bal_set, "홀짝·저고 균형"),
-        ("🤖 AI 가중", ai_set, f"최근 {lookback}회 빈도 가중 샘플링"),
+        ("🤖 AI 가중", ai_set, f"최근 {LOOKBACK}회 빈도 가중 샘플링"),
     ]
+    bonus_cands = bonus_candidates(df, lookback=LOOKBACK, topk=5) if INCLUDE_BONUS else []
+    R = rolling_frequency(df, window=LOOKBACK, include_bonus=INCLUDE_BONUS)
 
-    bonus_cands = bonus_candidates(df, lookback=lookback, topk=5) if include_bonus else []
-    R = rolling_frequency(df, window=lookback, include_bonus=include_bonus)
+    logged = st.session_state.get("logged_in", False)
 
-    for title, picked, subtitle in sets:
+    for idx, (title, picked, subtitle) in enumerate(sets):
         with st.container(border=True):
-            cA, cB = st.columns([1,3], gap="large")
+            cA, cB = st.columns([1, 3], gap="large")
 
-            # --- 카드 요약
             with cA:
                 st.markdown(f"### {title}")
                 st.markdown(f"<span style='color:#9CA3AF'>{subtitle}</span>", unsafe_allow_html=True)
-                st.markdown(f"**번호**: <span style='font-size:20px'>{', '.join(f'{n:02d}' for n in picked)}</span>", unsafe_allow_html=True)
-                comp = composition_metrics(picked)
-                cc1, cc2, cc3 = st.columns(3)
-                with cc1:
-                    st.metric("합계", comp["sum"]); st.metric("홀수개수", comp["odd"])
-                with cc2:
-                    st.metric("범위", comp["range"]); st.metric("저번호(≤22)", comp["low"])
-                with cc3:
-                    st.metric("연속수 포함", "Yes" if comp["consecutive"] else "No")
-                    st.caption(f"끝자리: {', '.join(map(str, comp['last_digits']))}")
-                if include_bonus and bonus_cands:
-                    st.info(f"보너스 후보(최근 {lookback}회 Top): {', '.join(f'{b:02d}' for b in bonus_cands)}")
+                if idx == 0 or logged:
+                    st.markdown(f"**번호**: <span style='font-size:20px'>{', '.join(f'{n:02d}' for n in picked)}</span>",
+                                unsafe_allow_html=True)
+                    comp = composition_metrics(picked)
+                    cc1, cc2, cc3 = st.columns(3)
+                    with cc1:
+                        st.metric("합계", comp["sum"]); st.metric("홀수개수", comp["odd"])
+                    with cc2:
+                        st.metric("범위", comp["range"]); st.metric("저번호(≤22)", comp["low"])
+                    with cc3:
+                        st.metric("연속수 포함", "Yes" if comp["consecutive"] else "No")
+                        st.caption(f"끝자리: {', '.join(map(str, comp['last_digits']))}")
+                    if INCLUDE_BONUS and bonus_cands:
+                        st.info(f"보너스 후보(최근 {LOOKBACK}회 Top): {', '.join(f'{b:02d}' for b in bonus_cands)}")
+                else:
+                    st.markdown("**번호**: ███ ███ ███ ███ ███ ███")
+                    st.caption("🔒 로그인 후 확인 가능합니다")
 
-            # --- 근거 시각화
             with cB:
-                c1, c2 = st.columns(2, gap="large")
+                if idx == 0 or logged:
+                    c1, c2 = st.columns(2, gap="large")
+                    # 빈도 막대(선택번호 강조)
+                    colors = ["#334155"] * 45
+                    for n in picked: colors[n - 1] = "#3B82F6"
+                    fig_freq = px.bar(
+                        x=[str(i) for i in nums_all],
+                        y=[int(freq.get(i, 0)) for i in nums_all],
+                        title="전체 빈도",
+                    )
+                    fig_freq.update_traces(marker_color=colors)
+                    fig_freq.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+                                           plot_bgcolor="rgba(0,0,0,0)", height=320,
+                                           margin=dict(l=10, r=10, t=50, b=10),
+                                           xaxis_title="번호", yaxis_title="빈도",
+                                           title_font=dict(size=20, color="#E5E7EB"))
+                    c1.plotly_chart(fig_freq, use_container_width=True)
 
-                # 근거①: 전체 빈도(선택번호 강조)
-                colors = ["#334155"] * 45
-                for n in picked: colors[n-1] = "#3B82F6"
-                fig_freq = px.bar(
-                    x=[str(i) for i in nums_all],
-                    y=[int(freq.get(i,0)) for i in nums_all],
-                    title="전체 빈도",
-                )
-                fig_freq.update_traces(marker_color=colors)
-                fig_freq.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                                       height=320, margin=dict(l=10,r=10,t=50,b=10),
-                                       xaxis_title="번호", yaxis_title="빈도", title_font=dict(size=20, color="#E5E7EB"))
-                c1.plotly_chart(fig_freq, use_container_width=True)
+                    # 공출현 히트맵 + 선택쌍
+                    vmax = float(np.quantile(co_df.values, 0.99))
+                    fig_co2 = make_heatmap(co_df, title="공출현 히트맵 + 선택쌍",
+                                           zmin=0, zmax=vmax, colorscale="YlGnBu", height=320)
+                    xs, ys = [], []
+                    for i in range(len(picked)):
+                        for j in range(i + 1, len(picked)):
+                            a, b = picked[i], picked[j]
+                            xs += [f"{a:02d}", f"{b:02d}"]; ys += [f"{b:02d}", f"{a:02d}"]
+                    if xs:
+                        fig_co2.add_scatter(x=xs, y=ys, mode="markers",
+                                            marker=dict(size=10, color="#EF4444"), name="선택쌍")
+                    c2.plotly_chart(fig_co2, use_container_width=True)
 
-                # 근거②: 공출현 히트맵 + 선택쌍 오버레이
-                vmax = float(np.quantile(co_df.values, 0.99))
-                fig_co2 = make_heatmap(co_df, title="공출현 히트맵 + 선택쌍",
-                                       zmin=0, zmax=vmax, colorscale="YlGnBu", height=320)
-                xs, ys = [], []
-                for i in range(len(picked)):
-                    for j in range(i+1, len(picked)):
-                        a, b = picked[i], picked[j]
-                        xs += [f"{a:02d}", f"{b:02d}"]; ys += [f"{b:02d}", f"{a:02d}"]
-                if xs:
-                    fig_co2.add_scatter(x=xs, y=ys, mode="markers",
-                                        marker=dict(size=10, color="#EF4444"), name="선택쌍")
-                c2.plotly_chart(fig_co2, use_container_width=True)
+                    # 롤링 빈도(선택 번호만)
+                    subR = R[[n for n in picked]]
+                    fig_roll = px.line(subR, title=f"최근 {LOOKBACK}회 롤링 빈도(선택 번호만)",
+                                       labels={"index": "회차(draw_no)", "value": "빈도(창 내)"})
+                    fig_roll.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+                                           plot_bgcolor="rgba(0,0,0,0)", height=300,
+                                           legend_title_text="번호", margin=dict(l=10, r=10, t=50, b=10),
+                                           title_font=dict(size=20, color="#E5E7EB"))
+                    st.plotly_chart(fig_roll, use_container_width=True)
+                else:
+                    locked_box(320)
 
-                # 근거③: 롤링 빈도(선택번호만)
-                subR = R[[n for n in picked]]
-                fig_roll = px.line(subR, title=f"최근 {lookback}회 롤링 빈도(선택 번호만)",
-                                   labels={"index":"회차(draw_no)", "value":"빈도(창 내)"})
-                fig_roll.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                                       height=300, legend_title_text="번호",
-                                       margin=dict(l=10,r=10,t=50,b=10), title_font=dict(size=20, color="#E5E7EB"))
-                st.plotly_chart(fig_roll, use_container_width=True)
-
-
-# ======================================================================
-# 2) 구성 탭  (요약 탭 내용 + 구성 분석을 한 곳에)
-# ======================================================================
+# -------------------------
+# 5-2) 구성 탭
+# -------------------------
 with tab_comp:
-    # ---- (A) 핵심 요약: Top N · Top 쌍 · 히트맵 2개 ----
-    st.subheader("핵심 요약")
+    if not st.session_state.get("logged_in", False):
+        st.info("🔒 로그인 후 이용 가능한 섹션입니다.")
+        locked_box(420, "🔒 로그인 후 전체 분석을 확인하세요")
+    else:
+        st.subheader("핵심 요약")
+        r1c1, r1c2 = st.columns(2, gap="large")
+        with r1c1:
+            top_title = f"Top {TOPN} Frequency — {'Bonus Included' if INCLUDE_BONUS else 'Bonus Excluded'}"
+            fig_freq_top = make_top_frequency_vertical(freq, topn=TOPN, title=top_title, compact=COMPACT)
+            st.plotly_chart(fig_freq_top, use_container_width=True)
+        with r1c2:
+            sig_pairs = pair_significance_binomial(co_df, n_draws=len(presence), include_bonus=INCLUDE_BONUS, alpha=0.05)
+            top_pairs = sig_pairs.sort_values("co_count", ascending=False).head(TOPN)
+            fig_tp = make_top_pairs_vertical(top_pairs, title=f"Top {TOPN} Co-occurring Pairs (붉은색=FDR 유의)", compact=COMPACT)
+            st.plotly_chart(fig_tp, use_container_width=True)
 
-    # 1행: Top N 빈도 + Top 쌍
-    r1c1, r1c2 = st.columns(2, gap="large")
-    with r1c1:
-        top_title = f"Top {topn} Frequency — {'Bonus Included' if include_bonus else 'Bonus Excluded'}"
-        if bar_dir == "세로":
-            fig_freq_top = make_top_frequency_vertical(freq, topn=topn, title=top_title, compact=compact)
-        else:
-            fig_freq_top = make_top_frequency_horizontal(freq, topn=topn, title=top_title, compact=compact)
-        st.plotly_chart(fig_freq_top, use_container_width=True)
+        r2c1, r2c2 = st.columns(2, gap="large")
+        with r2c1:
+            vmax = float(np.quantile(co_df.values, 0.99))
+            fig_co = make_heatmap(co_df, title=f"Pair Co-occurrence Heatmap — {'Bonus Included' if INCLUDE_BONUS else 'Bonus Excluded'}",
+                                  zmin=0, zmax=vmax, colorscale="YlGnBu", compact=COMPACT)
+            st.plotly_chart(fig_co, use_container_width=True)
+        with r2c2:
+            # 고정 옵션: abs=True, cluster=True, triangle=True, contrast=0.25
+            fig_corr = make_corr_heatmap_pro(
+                corr, title="Correlation Heatmap",
+                abs_mode=True, cluster=True, triangle=True, contrast=0.25, compact=COMPACT
+            )
+            st.plotly_chart(fig_corr, use_container_width=True)
 
-    with r1c2:
-        sig_pairs = pair_significance_binomial(co_df, n_draws=len(presence), include_bonus=include_bonus, alpha=0.05)
-        top_pairs = sig_pairs.sort_values("co_count", ascending=False).head(topn)
-        fig_tp = make_top_pairs_vertical(top_pairs, title=f"Top {topn} Co-occurring Pairs (붉은색=FDR 유의)", compact=compact)
-        st.plotly_chart(fig_tp, use_container_width=True)
+        st.markdown("---")
+        st.subheader("구성 분석 — 홀짝·끝자리·연속수·합계·범위")
+        feats = build_features(df)
+        c1, c2, c3 = st.columns(3)
+        fig_sum = px.histogram(feats, x="sum", nbins=30, title="합계 분포")
+        fig_sum.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                              height=320, title_font=dict(size=20, color="#E5E7EB"))
+        c1.plotly_chart(fig_sum, use_container_width=True)
 
-    # 2행: 히트맵 2개
-    r2c1, r2c2 = st.columns(2, gap="large")
-    with r2c1:
-        vmax = float(np.quantile(co_df.values, 0.99))
-        fig_co = make_heatmap(co_df, title=f"Pair Co-occurrence Heatmap — {'Bonus Included' if include_bonus else 'Bonus Excluded'}",
-                              zmin=0, zmax=vmax, colorscale="YlGnBu", compact=compact)
-        st.plotly_chart(fig_co, use_container_width=True)
-    with r2c2:
-        with st.expander("Correlation 히트맵 옵션", expanded=False):
-            corr_abs = st.toggle("절대값 보기 (|r|)", value=True)
-            corr_cluster = st.toggle("클러스터링 재정렬", value=True)
-            corr_triangle = st.toggle("하삼각만 보기", value=True)
-            corr_contrast = st.slider("표시 범위", 0.05, 1.0, 0.25, 0.05,
-                                      help="절대값(|r|)일 때 [0..값], 아닐 때 [−값..+값]")
+        fig_rng = px.histogram(feats, x="range", nbins=25, title="범위(최대-최소) 분포")
+        fig_rng.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                              height=320, title_font=dict(size=20, color="#E5E7EB"))
+        c2.plotly_chart(fig_rng, use_container_width=True)
 
-        fig_corr = make_corr_heatmap_pro(
-            corr,
-            title="Correlation Heatmap",
-            abs_mode=corr_abs,
-            cluster=corr_cluster,
-            triangle=corr_triangle,
-            contrast=float(corr_contrast),
-            compact=compact
-        )
-        st.plotly_chart(fig_corr, use_container_width=True)
+        odd_counts = feats["odd_cnt"].value_counts().sort_index()
+        fig_odd = px.bar(x=[str(i) for i in odd_counts.index], y=odd_counts.values, title="홀수 개수 분포")
+        fig_odd.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                              height=320, xaxis_title="홀수 개수", yaxis_title="회수", title_font=dict(size=20, color="#E5E7EB"))
+        c3.plotly_chart(fig_odd, use_container_width=True)
 
-    # Hot/Cold 표 + 다운로드
-    with st.expander("Hot / Cold 표 보기 & 다운로드", expanded=False):
-        c_hot, c_cold = st.columns(2)
-        with c_hot:
-            st.markdown("**Top 10 Hot**")
-            st.dataframe(freq.sort_values(ascending=False).head(10).rename("count").to_frame(),
-                         use_container_width=True, height=280)
-        with c_cold:
-            st.markdown("**Top 10 Cold**")
-            st.dataframe(freq.sort_values(ascending=True).head(10).rename("count").to_frame(),
-                         use_container_width=True, height=280)
+        st.markdown("**끝자리(Last digit) 분포**")
+        ld = last_digit_hist(df)
+        fig_ld = px.bar(x=[str(i) for i in ld.index], y=ld.values, title="끝자리 분포(0~9)")
+        fig_ld.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                             height=360, xaxis_title="끝자리", yaxis_title="빈도", title_font=dict(size=20, color="#E5E7EB"))
+        st.plotly_chart(fig_ld, use_container_width=True)
 
-        c_dl1, c_dl2, c_dl3 = st.columns(3)
-        with c_dl1:
-            st.download_button("⬇️ 빈도 CSV", data=freq.rename("count").reset_index().to_csv(index=False).encode("utf-8-sig"),
-                               file_name=f"frequency_{'with' if include_bonus else 'no'}_bonus.csv", mime="text/csv")
-        with c_dl2:
-            st.download_button("⬇️ 공출현 행렬 CSV", data=co_df.reset_index().to_csv(index=False).encode("utf-8-sig"),
-                               file_name=f"pair_cooccurrence_{'with' if include_bonus else 'no'}_bonus.csv", mime="text/csv")
-        with c_dl3:
-            st.download_button("⬇️ 상관 행렬 CSV", data=corr.reset_index().to_csv(index=False).encode("utf-8-sig"),
-                               file_name=f"correlation_{'with' if include_bonus else 'no'}_bonus.csv", mime="text/csv")
+        rate_consec = feats["has_consecutive"].mean()
+        st.metric("연속수 포함 비율", f"{rate_consec*100:.1f}%")
 
-    st.markdown("---")
-
-    # ---- (B) 구성 분석: 홀짝·끝자리·연속수·합계·범위 ----
-    st.subheader("구성 분석 — 홀짝·끝자리·연속수·합계·범위")
-    feats = build_features(df)
-
-    c1, c2, c3 = st.columns(3)
-    fig_sum = px.histogram(feats, x="sum", nbins=30, title="합계 분포")
-    fig_sum.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                          height=320, title_font=dict(size=20, color="#E5E7EB"))
-    c1.plotly_chart(fig_sum, use_container_width=True)
-
-    fig_rng = px.histogram(feats, x="range", nbins=25, title="범위(최대-최소) 분포")
-    fig_rng.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                          height=320, title_font=dict(size=20, color="#E5E7EB"))
-    c2.plotly_chart(fig_rng, use_container_width=True)
-
-    odd_counts = feats["odd_cnt"].value_counts().sort_index()
-    fig_odd = px.bar(x=[str(i) for i in odd_counts.index], y=odd_counts.values, title="홀수 개수 분포")
-    fig_odd.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                          height=320, xaxis_title="홀수 개수", yaxis_title="회수", title_font=dict(size=20, color="#E5E7EB"))
-    c3.plotly_chart(fig_odd, use_container_width=True)
-
-    st.markdown("**끝자리(Last digit) 분포**")
-    ld = last_digit_hist(df)
-    fig_ld = px.bar(x=[str(i) for i in ld.index], y=ld.values, title="끝자리 분포(0~9)")
-    fig_ld.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                         height=360, xaxis_title="끝자리", yaxis_title="빈도", title_font=dict(size=20, color="#E5E7EB"))
-    st.plotly_chart(fig_ld, use_container_width=True)
-
-    rate_consec = feats["has_consecutive"].mean()
-    st.metric("연속수 포함 비율", f"{rate_consec*100:.1f}%")
-
-# ======================================================================
-# 3) 공정성 체크 탭
-# ======================================================================
+# -------------------------
+# 5-3) 공정성 체크 탭
+# -------------------------
 with tab_fair:
-    st.subheader("무작위성 가정 검정 (Uniformity & Pair Over-representation)")
-    chi = chi_square_uniform(freq)
-    cfa, cfb = st.columns(2)
-    with cfa: st.metric("χ² 통계량", f"{chi['stat']:.2f}")
-    with cfb: st.metric("p-value", f"{chi['pvalue']:.4f}")
+    if not st.session_state.get("logged_in", False):
+        st.info("🔒 로그인 후 이용 가능한 섹션입니다.")
+        locked_box(420, "🔒 로그인 후 공정성 검정을 확인하세요")
+    else:
+        st.subheader("무작위성 가정 검정 (Uniformity & Pair Over-representation)")
+        chi = chi_square_uniform(freq)
+        cfa, cfb = st.columns(2)
+        with cfa: st.metric("χ² 통계량", f"{chi['stat']:.2f}")
+        with cfb: st.metric("p-value", f"{chi['pvalue']:.4f}")
 
-    n_draws = len(presence)
-    sig_pairs = pair_significance_binomial(co_df, n_draws=n_draws, include_bonus=include_bonus, alpha=0.05)
-    st.markdown("**쌍 과대표현(상향) FDR 보정 결과 (상위 50 표시)**")
-    st.dataframe(sig_pairs.head(50), use_container_width=True, height=500)
-    st.caption("모형: 45개 중 6(또는 7)개 무작위 추출 가정. Binomial 상향 단측, FDR 보정(BH).")
+        n_draws = len(presence)
+        sig_pairs = pair_significance_binomial(co_df, n_draws=n_draws, include_bonus=INCLUDE_BONUS, alpha=0.05)
+        st.markdown("**쌍 과대표현(상향) FDR 보정 결과 (상위 50 표시)**")
+        st.dataframe(sig_pairs.head(50), use_container_width=True, height=500)
+        st.caption("모형: 45개 중 6(또는 7)개 무작위 추출 가정. Binomial 상향 단측, FDR 보정(BH).")
+
+# -------------------------
+# 5-4) 회원 관리 탭 (간단 Admin)
+# -------------------------
+with tab_members:
+    st.subheader("👥 회원 관리")
+    # 간단 보호: 관리자 코드(선택) 확인
+    admin_ok = False
+    admin_code_needed = False
+    try:
+        expected = st.secrets["admin"]["code"]
+        admin_code_needed = True
+    except Exception:
+        expected = None
+        admin_code_needed = False
+
+    if admin_code_needed:
+        code = st.text_input("관리자 코드 입력", type="password")
+        if code and expected and code == expected:
+            admin_ok = True
+        elif code:
+            st.error("관리자 코드가 올바르지 않습니다.")
+    else:
+        st.info("관리자 코드가 설정되어 있지 않아 바로 열람됩니다.")
+        admin_ok = True
+
+    if admin_ok:
+        mdf = _load_members_csv()
+        st.dataframe(mdf, use_container_width=True, height=420)
+        st.download_button("⬇️ 회원 CSV 다운로드",
+                           data=mdf.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="members.csv",
+                           mime="text/csv")
+        st.caption("※ 전화번호는 해시 및 E.164 형식으로 저장됩니다. 실제 운영 시 보관기간/파기정책을 고지하세요.")
+    else:
+        locked_box(240, "🔒 관리자 검증 필요")
