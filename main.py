@@ -208,27 +208,31 @@ def locked_box(height: int = 220, msg: str = "🔒 로그인 후 확인 가능�
 # =========================
 _ensure_dirs()
 
-# 최초 실행 시 자동으로 CSV 생성/업데이트
+# 앱 시작 시 항상 한 번 최신 회차까지 동기화 (증분 업데이트는 매우 빠름)
 if "df" not in st.session_state:
-    df_try = load_csv(DATA_CSV)
-
-    if df_try.empty:
-        with st.spinner("📥 최초 실행: 로또 데이터 자동 수집/업로드 중..."):
-            try:
-                df_try, prev_max, latest_api = incremental_update(DATA_CSV)
-                try:
-                    st.toast(f"데이터 {prev_max+1}~{latest_api}회차까지 수집 완료!", icon="✅")
-                except Exception:
-                    pass  # 일부 환경은 toast 미지원
-            except Exception as e:
-                st.error(f"데이터 자동 수집에 실패했습니다. 네트워크 또는 권한을 확인하세요.\n\n에러: {e}")
+    with st.spinner("🔄 로또 데이터 최신 회차까지 동기화 중..."):
+        try:
+            # incremental_update는 이미 '최신이면 바로 반환'하도록 최적화되어 있음
+            df_synced, prev_max, latest_api = incremental_update(DATA_CSV)
+            if prev_max < latest_api:
+                try: st.toast(f"{prev_max+1}~{latest_api}회차까지 갱신 완료!", icon="✅")
+                except Exception: pass
+        except Exception as e:
+            # 네트워크 실패 시 로컬 CSV로 폴백
+            df_local = load_csv(DATA_CSV)
+            if df_local.empty:
+                st.error(f"데이터가 없고, 자동 수집도 실패했습니다. 에러: {e}")
                 st.stop()
-
-    st.session_state["df"] = df_try
+            st.warning(f"네트워크 문제로 로컬 CSV만 사용합니다. 표시된 기간이 최신이 아닐 수 있어요.\n원인: {e}")
+            df_synced = df_local
+        else:
+            # 정상 동기화된 경우
+            pass
+    st.session_state["df"] = df_synced
 
 df = st.session_state["df"]
 if df.empty:
-    st.error("데이터 로드 실패: lotto_draws.csv가 여전히 비어 있습니다. 네트워크/접근권한을 확인하세요.")
+    st.error("데이터 로드 실패: lotto_draws.csv가 비어 있습니다.")
     st.stop()
 
 latest = int(df["draw_no"].max())
@@ -241,7 +245,6 @@ with c3: kpi_card("기간", f"{df['date'].min()} → {df['date'].max()}")
 with c4: kpi_card("보너스 포함", "Yes" if INCLUDE_BONUS else "No")
 
 st.title("🎯 Lotto 6/45 Analyzer — Pro")
-
 # =========================
 # 4) 핵심 계산
 # =========================
