@@ -20,20 +20,22 @@ def _fetch_draw_json(drw_no: int, session: requests.Session) -> Optional[Dict]:
     except Exception:
         return None
 
+# lotto_data.py
 def find_latest_draw(session: requests.Session, start_guess: int = 1600) -> int:
+    # 1) 큰 값에서 내려오며 '존재하는 회차(앵커)' 하나를 찾는다.
     hi = start_guess
     while hi > 1 and _fetch_draw_json(hi, session) is None:
-        hi -= 10
-        if hi < 1000:
-            break
-    lo = max(1, hi - 800)
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if _fetch_draw_json(mid, session) is not None:
-            lo = mid
-        else:
-            hi = mid - 1
-    return lo
+        hi -= 10  # 블록 단위 백오프 (10은 임의, 50 등으로 바꿔도 됨)
+
+    if hi < 1:
+        hi = 1
+
+    # 2) 앵커에서 위로 전개: 존재하는 동안 +1씩 올려 '진짜 최신'까지 간다.
+    while _fetch_draw_json(hi + 1, session) is not None:
+        hi += 1
+
+    return hi
+
 
 def collect_range(session: requests.Session, start_no: int, end_no: int) -> pd.DataFrame:
     rows = []
