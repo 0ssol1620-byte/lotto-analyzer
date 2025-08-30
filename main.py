@@ -4,7 +4,7 @@ from __future__ import annotations
 import os, re, hashlib, datetime, requests
 import numpy as np, pandas as pd, streamlit as st, plotly.express as px
 
-from lotto_data import load_csv, frequency, presence_matrix, cooccurrence
+from lotto_data import load_csv, frequency, presence_matrix, cooccurrence, incremental_update
 from rolling import rolling_frequency
 from recs import (
     recommend_hot, recommend_cold, recommend_balanced, recommend_weighted_recent,
@@ -207,12 +207,30 @@ def locked_box(height: int = 220, msg: str = "🔒 로그인 후 확인 가능�
 # 3) 데이터 로딩 & KPI
 # =========================
 _ensure_dirs()
+
+# 최초 실행 시 자동으로 CSV 생성/업데이트
 if "df" not in st.session_state:
-    st.session_state["df"] = load_csv(DATA_CSV)
+    df_try = load_csv(DATA_CSV)
+
+    if df_try.empty:
+        with st.spinner("📥 최초 실행: 로또 데이터 자동 수집/업로드 중..."):
+            try:
+                df_try, prev_max, latest_api = incremental_update(DATA_CSV)
+                try:
+                    st.toast(f"데이터 {prev_max+1}~{latest_api}회차까지 수집 완료!", icon="✅")
+                except Exception:
+                    pass  # 일부 환경은 toast 미지원
+            except Exception as e:
+                st.error(f"데이터 자동 수집에 실패했습니다. 네트워크 또는 권한을 확인하세요.\n\n에러: {e}")
+                st.stop()
+
+    st.session_state["df"] = df_try
+
 df = st.session_state["df"]
 if df.empty:
-    st.warning("원본 CSV가 비어 있습니다. `data/lotto_draws.csv`를 업로드/배포해 주세요.")
+    st.error("데이터 로드 실패: lotto_draws.csv가 여전히 비어 있습니다. 네트워크/접근권한을 확인하세요.")
     st.stop()
+
 latest = int(df["draw_no"].max())
 
 # KPI
