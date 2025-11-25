@@ -12,6 +12,8 @@ local CSV, and provides an interactive dashboard for:
 - Recommendation strategies (hot, cold, balanced, weighted recent)
 - Basic fairness tests for uniformity and pair over-representation
 
+<img width="1757" height="676" alt="image" src="https://github.com/user-attachments/assets/d15d4c43-a40e-4f0f-be7d-64b5b43daed5" />
+
 ---
 
 ## Features
