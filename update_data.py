@@ -1,7 +1,7 @@
 # update_data.py
 # -*- coding: utf-8 -*-
 import argparse, sys
-from lotto_data_fixed import incremental_update
+from lotto_data import incremental_update
 
 def main():
     p = argparse.ArgumentParser(description="Lotto 6/45 incremental updater")
@@ -19,3 +19,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main() or 0)
+
