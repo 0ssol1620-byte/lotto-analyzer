@@ -4,7 +4,7 @@ from __future__ import annotations
 import os, re, hashlib, datetime, requests
 import numpy as np, pandas as pd, streamlit as st, plotly.express as px
 
-from lotto_data_fixed import load_csv, frequency, presence_matrix, cooccurrence, incremental_update
+from lotto_data import load_csv, frequency, presence_matrix, cooccurrence, incremental_update
 from rolling import rolling_frequency
 from recs import (
     recommend_hot, recommend_cold, recommend_balanced, recommend_weighted_recent,
@@ -463,3 +463,4 @@ if is_admin:
                            file_name="members.csv",
                            mime="text/csv")
         st.caption("※ 전화번호는 해시 및 E.164 형식으로 저장됩니다. 실제 운영 시 보관기간/파기정책을 고지하세요.")
+
