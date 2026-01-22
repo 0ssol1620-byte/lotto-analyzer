@@ -4,7 +4,7 @@ from __future__ import annotations
 import os, re, hashlib, datetime, requests
 import numpy as np, pandas as pd, streamlit as st, plotly.express as px
 
-from lotto_data import load_csv, frequency, presence_matrix, cooccurrence, incremental_update
+from lotto_data_fixed import load_csv, frequency, presence_matrix, cooccurrence, incremental_update
 from rolling import rolling_frequency
 from recs import (
     recommend_hot, recommend_cold, recommend_balanced, recommend_weighted_recent,
@@ -221,7 +221,7 @@ if "df" not in st.session_state:
             # 네트워크 실패 시 로컬 CSV로 폴백
             df_local = load_csv(DATA_CSV)
             if df_local.empty:
-                st.error(f"데이터가 없고, 자동 수집도 실패했습니다. 에러: {e}")
+                st.error(f"데이터가 없고, 자동 수집도 실패했습니다.\n원인: {e}\n\nTIP: 동행복권 API가 리다이렉트/차단되면 수집이 0건이 됩니다.\n - 다른 네트워크(집/모바일 핫스팟)에서 실행\n - 서버라면 IP 대역 변경(클라우드/회사망 차단 가능)\n - 브라우저에서 https://www.dhlottery.co.kr/common.do?drwNo=1000&method=getLottoNumber 가 JSON으로 열리는지 확인")
                 st.stop()
             st.warning(f"네트워크 문제로 로컬 CSV만 사용합니다. 표시된 기간이 최신이 아닐 수 있어요.\n원인: {e}")
             df_synced = df_local
